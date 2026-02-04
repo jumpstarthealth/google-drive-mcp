@@ -262,7 +262,8 @@ async function checkFileExists(name: string, parentFolderId: string = 'root'): P
 const SearchSchema = z.object({
   query: z.string().min(1, "Search query is required"),
   pageSize: z.number().int().min(1).max(100).optional(),
-  pageToken: z.string().optional()
+  pageToken: z.string().optional(),
+  driveId: z.string().optional() // Shared Drive ID to scope search
 });
 
 const CreateTextFileSchema = z.object({
@@ -285,7 +286,8 @@ const CreateFolderSchema = z.object({
 const ListFolderSchema = z.object({
   folderId: z.string().optional(),
   pageSize: z.number().int().min(1).max(100).optional(),
-  pageToken: z.string().optional()
+  pageToken: z.string().optional(),
+  driveId: z.string().optional() // Shared Drive ID to scope listing
 });
 
 const DeleteItemSchema = z.object({
@@ -723,13 +725,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "search",
-        description: "Search for files in Google Drive",
+        description: "Search for files in Google Drive. When driveId is provided, search is scoped to that Shared Drive only.",
         inputSchema: {
           type: "object",
           properties: {
             query: { type: "string", description: "Search query" },
             pageSize: { type: "number", description: "Results per page (default 50, max 100)" },
-            pageToken: { type: "string", description: "Token for next page of results" }
+            pageToken: { type: "string", description: "Token for next page of results" },
+            driveId: { type: "string", description: "Optional Shared Drive ID to scope search to a specific Shared Drive" }
           },
           required: ["query"],
         },
@@ -774,13 +777,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "listFolder",
-        description: "List contents of a folder (defaults to root)",
+        description: "List contents of a folder. When driveId is provided, listing is scoped to that Shared Drive.",
         inputSchema: {
           type: "object",
           properties: {
             folderId: { type: "string", description: "Folder ID", optional: true },
             pageSize: { type: "number", description: "Items to return (default 50, max 100)", optional: true },
-            pageToken: { type: "string", description: "Token for next page", optional: true }
+            pageToken: { type: "string", description: "Token for next page", optional: true },
+            driveId: { type: "string", description: "Optional Shared Drive ID to scope listing to a specific Shared Drive" }
           }
         }
       },
@@ -1409,19 +1413,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!validation.success) {
           return errorResponse(validation.error.errors[0].message);
         }
-        const { query: userQuery, pageSize, pageToken } = validation.data;
+        const { query: userQuery, pageSize, pageToken, driveId } = validation.data;
 
         const escapedQuery = userQuery.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
         const formattedQuery = `fullText contains '${escapedQuery}' and trashed = false`;
 
-        const res = await drive.files.list({
+        // Build search params - add driveId scoping if provided
+        const searchParams: any = {
           q: formattedQuery,
           pageSize: Math.min(pageSize || 50, 100),
           pageToken: pageToken,
           fields: "nextPageToken, files(id, name, mimeType, modifiedTime, size)",
           includeItemsFromAllDrives: true,
           supportsAllDrives: true
-        });
+        };
+
+        // If driveId is provided, scope search to that Shared Drive only
+        if (driveId) {
+          searchParams.corpora = 'drive';
+          searchParams.driveId = driveId;
+          log('Scoping search to Shared Drive', { driveId });
+        }
+
+        const res = await drive.files.list(searchParams);
 
         const fileList = res.data.files?.map((f: drive_v3.Schema$File) => `${f.name} (${f.mimeType})`).join("\n") || '';
         log('Search results', { query: userQuery, resultCount: res.data.files?.length });
@@ -1584,7 +1598,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Default to root if no folder specified
         const targetFolderId = args.folderId || 'root';
 
-        const res = await drive.files.list({
+        // Build list params - add driveId scoping if provided
+        const listParams: any = {
           q: `'${targetFolderId}' in parents and trashed = false`,
           pageSize: Math.min(args.pageSize || 50, 100),
           pageToken: args.pageToken,
@@ -1592,7 +1607,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           orderBy: "name",
           includeItemsFromAllDrives: true,
           supportsAllDrives: true
-        });
+        };
+
+        // If driveId is provided, scope listing to that Shared Drive only
+        if (args.driveId) {
+          listParams.corpora = 'drive';
+          listParams.driveId = args.driveId;
+          log('Scoping listFolder to Shared Drive', { driveId: args.driveId });
+        }
+
+        const res = await drive.files.list(listParams);
 
         const files = res.data.files || [];
         const formattedFiles = files.map((file: drive_v3.Schema$File) => {
